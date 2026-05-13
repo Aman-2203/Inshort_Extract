@@ -1,22 +1,3 @@
-"""
-Inshorts News Reporter
-======================
-Features:
-  1. Scrapes Inshorts and builds a Word report
-  2. Emails the report every 3 days via Gmail App Password
-  3. Tkinter UI: last 3 emails sent + countdown to next send
-  4. Site health-checker (background ping to keep your site alive)
-
-SETUP
------
-1. pip install requests beautifulsoup4 python-docx schedule
-2. Fill in the CONFIG section below.
-3. For Gmail: generate an App Password at
-   https://myaccount.google.com/apppasswords
-   (requires 2FA enabled on your Google account)
-4. Run:  python inshorts_reporter.py
-"""
-
 import io
 import os
 from dotenv import load_dotenv
@@ -46,7 +27,8 @@ load_dotenv()
 #  CONFIG  ← edit these values
 # ═══════════════════════════════════════════════════
 EMAIL_SENDER       = os.getenv("Email")      # Gmail address
-EMAIL_APP_PASSWORD =  os.getenv("psswd")       # 16-char App Password
+EMAIL_APP_PASSWORD =  os.getenv("psswd") 
+print(EMAIL_SENDER,EMAIL_APP_PASSWORD)      # 16-char App Password
 EMAIL_RECIPIENT    = "xxxxxspacm@gmail.com"       # where to send the report
 EMAIL_SUBJECT      = "Inshorts News Report"
 
