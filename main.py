@@ -32,7 +32,7 @@ print(EMAIL_SENDER,EMAIL_APP_PASSWORD)      # 16-char App Password
 EMAIL_RECIPIENT    = "xxxxxspacm@gmail.com"       # where to send the report
 EMAIL_SUBJECT      = "Inshorts News Report"
 
-HEALTH_CHECK_URL   = "https://your-site.com"       # site to ping (keep-alive)
+HEALTH_CHECK_URL   = "https://trial271225.onrender.com/"       # site to ping (keep-alive)
 HEALTH_CHECK_EVERY = 10                             # minutes between pings
 
 CATEGORIES  = ['national', 'business', 'sports', 'world', 'technology', 'startup']
