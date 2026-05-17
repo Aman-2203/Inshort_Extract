@@ -1,11 +1,11 @@
 import io
+import time
 import os
 from dotenv import load_dotenv
-import json
-import time
 import smtplib
 import threading
-from flask import Flask, render_template_string, jsonify
+import tkinter as tk
+from tkinter import ttk, messagebox
 from email.mime.multipart import MIMEMultipart
 from email.mime.base import MIMEBase
 from email.mime.text import MIMEText
@@ -21,15 +21,12 @@ from docx.oxml import OxmlElement
 
 import schedule
 load_dotenv()
-
-
 # ═══════════════════════════════════════════════════
 #  CONFIG  ← edit these values
 # ═══════════════════════════════════════════════════
-EMAIL_SENDER       = os.getenv("Email")      # Gmail address
-EMAIL_APP_PASSWORD =  os.getenv("psswd") 
-print(EMAIL_SENDER,EMAIL_APP_PASSWORD)      # 16-char App Password
-EMAIL_RECIPIENT    = "xxxxxspacm@gmail.com"       # where to send the report
+EMAIL_SENDER       = os.getenv("Email")       # Gmail address
+EMAIL_APP_PASSWORD = os.getenv("psswd")         # 16-char App Password
+EMAIL_RECIPIENT    = "recipient@example.com"       # where to send the report
 EMAIL_SUBJECT      = "Inshorts News Report"
 
 HEALTH_CHECK_URL   = "https://your-site.com"       # site to ping (keep-alive)
@@ -37,7 +34,6 @@ HEALTH_CHECK_EVERY = 10                             # minutes between pings
 
 CATEGORIES  = ['national', 'business', 'sports', 'world', 'technology', 'startup']
 MAX_PAGES   = 10
-STATE_FILE  = "reporter_state.json"               # persists email history
 
 SEND_INTERVAL_DAYS = 3                             # email every N days
 # ═══════════════════════════════════════════════════
@@ -54,19 +50,16 @@ HEADERS = {
 
 
 # ───────────────────────────────────────────────────
-#  STATE  (persist email history between restarts)
+#  STATE  (pure in-memory — no files, no disk writes)
 # ───────────────────────────────────────────────────
 
-def load_state() -> dict:
-    if os.path.exists(STATE_FILE):
-        with open(STATE_FILE, "r") as f:
-            return json.load(f)
-    return {"email_history": [], "next_send_ts": None}
-
-
-def save_state(state: dict):
-    with open(STATE_FILE, "w") as f:
-        json.dump(state, f, indent=2)
+# Single shared dict; lives only for the duration of this process.
+# email_history : list of dicts  (newest first, max 3 entries)
+# next_send_ts  : float | None   (Unix timestamp of next scheduled send)
+APP_STATE: dict = {
+    "email_history": [],
+    "next_send_ts":  None,
+}
 
 
 # ───────────────────────────────────────────────────
@@ -273,7 +266,6 @@ def run_job(state: dict, log_fn=print, refresh_ui_fn=None):
 
         next_ts = (datetime.now() + timedelta(days=SEND_INTERVAL_DAYS)).timestamp()
         state["next_send_ts"] = next_ts
-        save_state(state)
         log_fn(f"Next send scheduled: {datetime.fromtimestamp(next_ts).strftime('%d %b %Y %I:%M %p')}")
     except Exception as e:
         log_fn(f"Job error: {e}")
@@ -283,427 +275,228 @@ def run_job(state: dict, log_fn=print, refresh_ui_fn=None):
 
 
 # ───────────────────────────────────────────────────
-#  FLASK APP & BACKGROUND JOBS
+#  TKINTER UI
 # ───────────────────────────────────────────────────
 
-app = Flask(__name__)
+class ReporterApp(tk.Tk):
+    DARK_BG   = "#1e1e2e"
+    CARD_BG   = "#2a2a3e"
+    ACCENT    = "#7c6af7"
+    TEXT      = "#cdd6f4"
+    MUTED     = "#6c7086"
+    GREEN     = "#a6e3a1"
+    RED       = "#f38ba8"
+    AMBER     = "#fab387"
 
-# Global state and logs
-app_state = {}
-app_logs = []
-health_status = "Waiting for first ping..."
+    def __init__(self, state: dict):
+        super().__init__()
+        self.state     = state
+        self.title("Inshorts Reporter")
+        self.geometry("680x640")
+        self.resizable(False, False)
+        self.configure(bg=self.DARK_BG)
 
-def add_log(msg: str):
-    ts = datetime.now().strftime("%H:%M:%S")
-    app_logs.append(f"[{ts}] {msg}")
-    if len(app_logs) > 100:
-        app_logs.pop(0)
+        self._build_ui()
+        self._start_background_jobs()
+        self._tick()          # start 1-second countdown loop
 
-def bg_schedule_loop():
-    def check_schedule():
-        next_ts = app_state.get("next_send_ts")
+    # ── UI construction ──────────────────────────────
+
+    def _build_ui(self):
+        # ── Header ──
+        hdr = tk.Frame(self, bg=self.ACCENT, pady=10)
+        hdr.pack(fill="x")
+        tk.Label(hdr, text="📰  Inshorts Reporter", font=("Helvetica", 16, "bold"),
+                 bg=self.ACCENT, fg="white").pack()
+        tk.Label(hdr, text="Automated news digest via email",
+                 font=("Helvetica", 9), bg=self.ACCENT, fg="#e0d8ff").pack()
+
+        body = tk.Frame(self, bg=self.DARK_BG, padx=20, pady=15)
+        body.pack(fill="both", expand=True)
+
+        # ── Countdown card ──
+        cd_card = self._card(body, "⏱  Next Email Countdown")
+        self.countdown_var = tk.StringVar(value="Calculating…")
+        tk.Label(cd_card, textvariable=self.countdown_var,
+                 font=("Courier", 22, "bold"),
+                 bg=self.CARD_BG, fg=self.ACCENT).pack(pady=(0, 4))
+        self.next_date_var = tk.StringVar(value="")
+        tk.Label(cd_card, textvariable=self.next_date_var,
+                 font=("Helvetica", 9), bg=self.CARD_BG, fg=self.MUTED).pack()
+
+        # ── Email history ──
+        hist_card = self._card(body, "📬  Last 3 Emails Sent")
+        self.hist_frame = tk.Frame(hist_card, bg=self.CARD_BG)
+        self.hist_frame.pack(fill="x")
+        self._refresh_history()
+
+        # ── Health checker ──
+        hc_card = self._card(body, "🌐  Site Health")
+        self.health_var = tk.StringVar(value="Waiting for first ping…")
+        tk.Label(hc_card, textvariable=self.health_var,
+                 font=("Helvetica", 10), bg=self.CARD_BG,
+                 fg=self.TEXT, wraplength=580, justify="left").pack(anchor="w")
+
+        # ── Log box ──
+        log_card = self._card(body, "📋  Activity Log")
+        self.log_box = tk.Text(log_card, height=7, bg="#12121e", fg=self.TEXT,
+                               font=("Courier", 9), relief="flat",
+                               state="disabled", wrap="word")
+        self.log_box.pack(fill="x")
+        sb = ttk.Scrollbar(log_card, command=self.log_box.yview)
+        self.log_box.configure(yscrollcommand=sb.set)
+
+        # ── Buttons ──
+        btn_row = tk.Frame(self, bg=self.DARK_BG, pady=10)
+        btn_row.pack()
+        self._btn(btn_row, "▶  Run Now", self.ACCENT, self._manual_run).pack(side="left", padx=8)
+        self._btn(btn_row, "🌐  Ping Now", self.MUTED, self._manual_ping).pack(side="left", padx=8)
+
+    def _card(self, parent, title: str) -> tk.Frame:
+        outer = tk.Frame(parent, bg=self.DARK_BG, pady=6)
+        outer.pack(fill="x")
+        tk.Label(outer, text=title, font=("Helvetica", 10, "bold"),
+                 bg=self.DARK_BG, fg=self.MUTED).pack(anchor="w")
+        inner = tk.Frame(outer, bg=self.CARD_BG, padx=12, pady=10,
+                         highlightbackground=self.ACCENT,
+                         highlightthickness=1)
+        inner.pack(fill="x")
+        return inner
+
+    def _btn(self, parent, text, color, cmd):
+        return tk.Button(parent, text=text, command=cmd,
+                         bg=color, fg="white", font=("Helvetica", 10, "bold"),
+                         relief="flat", padx=16, pady=6, cursor="hand2",
+                         activebackground=self.ACCENT, activeforeground="white")
+
+    # ── Refresh helpers ──────────────────────────────
+
+    def _refresh_history(self):
+        for w in self.hist_frame.winfo_children():
+            w.destroy()
+        history = self.state.get("email_history", [])
+        if not history:
+            tk.Label(self.hist_frame, text="No emails sent yet.",
+                     bg=self.CARD_BG, fg=self.MUTED,
+                     font=("Helvetica", 9)).pack(anchor="w")
+            return
+        for i, rec in enumerate(history[:3]):
+            color = self.GREEN if "Sent" in rec["status"] else self.RED
+            row = tk.Frame(self.hist_frame, bg=self.CARD_BG)
+            row.pack(fill="x", pady=2)
+            tk.Label(row, text=f"{i+1}.", width=2,
+                     bg=self.CARD_BG, fg=self.MUTED,
+                     font=("Courier", 9)).pack(side="left")
+            tk.Label(row, text=rec["status"], width=10,
+                     bg=self.CARD_BG, fg=color,
+                     font=("Courier", 9, "bold")).pack(side="left")
+            tk.Label(row, text=rec["sent_at"],
+                     bg=self.CARD_BG, fg=self.TEXT,
+                     font=("Helvetica", 9)).pack(side="left", padx=8)
+            articles = rec.get("articles", "?")
+            tk.Label(row, text=f"({articles} articles)",
+                     bg=self.CARD_BG, fg=self.MUTED,
+                     font=("Helvetica", 9)).pack(side="left")
+
+    def _refresh_all(self):
+        self._refresh_history()
+
+    # ── Countdown tick (every second) ─────────────────
+
+    def _tick(self):
+        next_ts = self.state.get("next_send_ts")
+        if next_ts is None:
+            self.countdown_var.set("Send pending…")
+            self.next_date_var.set("(run once to schedule)")
+        else:
+            delta = datetime.fromtimestamp(next_ts) - datetime.now()
+            if delta.total_seconds() <= 0:
+                self.countdown_var.set("Sending now…")
+                self.next_date_var.set("")
+            else:
+                total_s  = int(delta.total_seconds())
+                days     = total_s // 86400
+                hours    = (total_s % 86400) // 3600
+                minutes  = (total_s % 3600) // 60
+                seconds  = total_s % 60
+                self.countdown_var.set(f"{days:02d}d  {hours:02d}h  {minutes:02d}m  {seconds:02d}s")
+                self.next_date_var.set(
+                    f"Scheduled: {datetime.fromtimestamp(next_ts).strftime('%d %b %Y  %I:%M %p')}"
+                )
+        self.after(1000, self._tick)
+
+    # ── Logging ──────────────────────────────────────
+
+    def log(self, msg: str):
+        ts = datetime.now().strftime("%H:%M:%S")
+        self.log_box.configure(state="normal")
+        self.log_box.insert("end", f"[{ts}] {msg}\n")
+        self.log_box.see("end")
+        self.log_box.configure(state="disabled")
+
+    # ── Background jobs ──────────────────────────────
+
+    def _start_background_jobs(self):
+        # Schedule email job every N days (checks every minute)
+        def _schedule_loop():
+            next_ts = self.state.get("next_send_ts")
+            if next_ts is None:
+                # First run: send immediately then schedule
+                self._do_run()
+            else:
+                schedule.every(1).minutes.do(self._check_schedule)
+                while True:
+                    schedule.run_pending()
+                    time.sleep(30)
+
+        # Schedule health check
+        def _health_loop():
+            schedule.every(HEALTH_CHECK_EVERY).minutes.do(self._do_health)
+            self._do_health()   # run once immediately
+            while True:
+                schedule.run_pending()
+                time.sleep(10)
+
+        threading.Thread(target=_schedule_loop, daemon=True).start()
+        threading.Thread(target=_health_loop,   daemon=True).start()
+
+    def _check_schedule(self):
+        next_ts = self.state.get("next_send_ts")
         if next_ts and datetime.now().timestamp() >= next_ts:
-            do_run()
+            self._do_run()
 
-    next_ts = app_state.get("next_send_ts")
-    if next_ts is None:
-        do_run()
-    else:
-        schedule.every(1).minutes.do(check_schedule)
-        while True:
-            schedule.run_pending()
-            time.sleep(30)
+    def _do_run(self):
+        self.log("Starting scheduled job…")
+        threading.Thread(
+            target=run_job,
+            args=(self.state, self.log, self._refresh_all),
+            daemon=True,
+        ).start()
 
-def bg_health_loop():
-    def do_health():
-        global health_status
-        health_status = health_check(add_log)
-    
-    schedule.every(HEALTH_CHECK_EVERY).minutes.do(do_health)
-    do_health()
-    while True:
-        schedule.run_pending()
-        time.sleep(10)
+    def _do_health(self):
+        def _ping():
+            status = health_check(self.log)
+            color  = self.GREEN if "✅" in status else self.RED
+            self.health_var.set(status)
+            # update label color
+            for widget in self.winfo_children():
+                pass   # colour already embedded in status string
+        threading.Thread(target=_ping, daemon=True).start()
 
-def do_run():
-    add_log("Starting scheduled job...")
-    threading.Thread(
-        target=run_job,
-        args=(app_state, add_log, None),
-        daemon=True,
-    ).start()
+    # ── Manual buttons ───────────────────────────────
 
-HTML_TEMPLATE = """
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Inshorts Reporter</title>
-    <script src="https://unpkg.com/feather-icons"></script>
-    <style>
-        :root {
-            --bg-color: #f9fafb;
-            --surface-color: #ffffff;
-            --text-primary: #111827;
-            --text-secondary: #6b7280;
-            --border-color: #e5e7eb;
-            --hover-color: #f3f4f6;
-            --button-bg: #111827;
-            --button-text: #ffffff;
-            --button-hover: #374151;
-        }
+    def _manual_run(self):
+        if messagebox.askyesno("Confirm", "Build report and send email now?"):
+            self._do_run()
 
-        * { box-sizing: border-box; }
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-            background-color: var(--bg-color);
-            color: var(--text-primary);
-            margin: 0;
-            padding: 20px 10px;
-            display: flex;
-            justify-content: center;
-        }
-        .container {
-            width: 100%;
-            max-width: 640px;
-            display: flex;
-            flex-direction: column;
-            gap: 20px;
-        }
-        .header {
-            text-align: center;
-            padding: 20px 0;
-        }
-        .header h1 {
-            margin: 0 0 8px 0;
-            font-size: 28px;
-            font-weight: 800;
-            letter-spacing: -0.5px;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            gap: 10px;
-        }
-        .header p {
-            margin: 0;
-            color: var(--text-secondary);
-            font-size: 15px;
-        }
-        .card {
-            background-color: var(--surface-color);
-            border: 1px solid var(--border-color);
-            border-radius: 12px;
-            padding: 24px;
-            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05), 0 2px 4px -1px rgba(0, 0, 0, 0.03);
-            transition: transform 0.2s ease, box-shadow 0.2s ease;
-        }
-        .card:hover {
-            box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.05), 0 4px 6px -2px rgba(0, 0, 0, 0.03);
-        }
-        .card-header {
-            display: flex;
-            align-items: center;
-            gap: 10px;
-            margin-bottom: 16px;
-            border-bottom: 1px solid var(--border-color);
-            padding-bottom: 12px;
-        }
-        .card-header h2 {
-            margin: 0;
-            font-size: 16px;
-            font-weight: 600;
-        }
-        .card-header svg {
-            color: var(--text-secondary);
-        }
-        
-        /* Countdown styling */
-        .countdown-container {
-            display: flex;
-            flex-direction: column;
-            align-items: flex-start;
-        }
-        #countdown {
-            font-size: 32px;
-            font-weight: 700;
-            font-variant-numeric: tabular-nums;
-            letter-spacing: -0.5px;
-            margin-bottom: 4px;
-        }
-        #next_date {
-            font-size: 14px;
-            color: var(--text-secondary);
-        }
+    def _manual_ping(self):
+        self._do_health()
 
-        /* History styling */
-        .history-list {
-            display: flex;
-            flex-direction: column;
-            gap: 12px;
-        }
-        .history-item {
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            padding: 12px;
-            background-color: var(--bg-color);
-            border-radius: 8px;
-            border: 1px solid var(--border-color);
-            font-size: 14px;
-        }
-        .history-item-left {
-            display: flex;
-            align-items: center;
-            gap: 12px;
-        }
-        .history-status {
-            font-weight: 600;
-            display: flex;
-            align-items: center;
-            gap: 6px;
-        }
-        .status-sent { color: #10b981; }
-        .status-failed { color: #ef4444; }
 
-        /* Health */
-        .health-status {
-            font-size: 15px;
-            display: flex;
-            align-items: center;
-            gap: 8px;
-            padding: 12px;
-            background-color: var(--bg-color);
-            border-radius: 8px;
-            border: 1px solid var(--border-color);
-        }
-
-        /* Logs */
-        .log-box {
-            font-family: SFMono-Regular, Consolas, 'Liberation Mono', Menlo, monospace;
-            font-size: 13px;
-            height: 200px;
-            overflow-y: auto;
-            background-color: #111827;
-            color: #e5e7eb;
-            padding: 16px;
-            border-radius: 8px;
-            line-height: 1.5;
-        }
-        .log-box::-webkit-scrollbar { width: 8px; }
-        .log-box::-webkit-scrollbar-track { background: #1f2937; border-radius: 4px; }
-        .log-box::-webkit-scrollbar-thumb { background: #4b5563; border-radius: 4px; }
-
-        /* Actions */
-        .actions {
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 16px;
-        }
-        button {
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            gap: 8px;
-            background-color: var(--button-bg);
-            color: var(--button-text);
-            border: none;
-            padding: 14px 20px;
-            border-radius: 8px;
-            font-size: 15px;
-            font-weight: 600;
-            cursor: pointer;
-            transition: background-color 0.2s ease, transform 0.1s ease;
-        }
-        button:hover { background-color: var(--button-hover); }
-        button:active { transform: scale(0.98); }
-        button.secondary {
-            background-color: var(--surface-color);
-            color: var(--text-primary);
-            border: 1px solid var(--border-color);
-        }
-        button.secondary:hover {
-            background-color: var(--hover-color);
-        }
-
-        @media (max-width: 480px) {
-            .actions { grid-template-columns: 1fr; }
-            .history-item { flex-direction: column; align-items: flex-start; gap: 8px; }
-            #countdown { font-size: 28px; }
-        }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <div class="header">
-            <h1><i data-feather="file-text"></i> Inshorts Reporter</h1>
-            <p>Automated news digest via email</p>
-        </div>
-        
-        <div class="card">
-            <div class="card-header">
-                <i data-feather="clock"></i>
-                <h2>Next Email Countdown</h2>
-            </div>
-            <div class="countdown-container">
-                <div id="countdown">Loading...</div>
-                <div id="next_date"></div>
-            </div>
-        </div>
-
-        <div class="card">
-            <div class="card-header">
-                <i data-feather="mail"></i>
-                <h2>Last 3 Emails Sent</h2>
-            </div>
-            <div class="history-list" id="history">Loading...</div>
-        </div>
-
-        <div class="card">
-            <div class="card-header">
-                <i data-feather="activity"></i>
-                <h2>Site Health</h2>
-            </div>
-            <div class="health-status" id="health">Loading...</div>
-        </div>
-
-        <div class="card">
-            <div class="card-header">
-                <i data-feather="terminal"></i>
-                <h2>Activity Log</h2>
-            </div>
-            <div class="log-box" id="logs">Loading...</div>
-        </div>
-
-        <div class="actions">
-            <button onclick="runNow()"><i data-feather="play"></i> Run Now</button>
-            <button onclick="pingNow()" class="secondary"><i data-feather="zap"></i> Ping Now</button>
-        </div>
-    </div>
-
-    <script>
-        feather.replace();
-
-        function updateUI() {
-            fetch('/api/status')
-                .then(r => r.json())
-                .then(data => {
-                    // Update countdown
-                    if (data.next_ts === null) {
-                        document.getElementById('countdown').innerText = "Send pending...";
-                        document.getElementById('next_date').innerText = "(Run once to schedule)";
-                    } else {
-                        let now = new Date().getTime() / 1000;
-                        let delta = data.next_ts - now;
-                        if (delta <= 0) {
-                            document.getElementById('countdown').innerText = "Sending now...";
-                            document.getElementById('next_date').innerText = "";
-                        } else {
-                            let d = Math.floor(delta / 86400);
-                            let h = Math.floor((delta % 86400) / 3600);
-                            let m = Math.floor((delta % 3600) / 60);
-                            let s = Math.floor(delta % 60);
-                            
-                            let pad = num => String(num).padStart(2, '0');
-                            document.getElementById('countdown').innerText = `${d}d ${pad(h)}h ${pad(m)}m ${pad(s)}s`;
-                            
-                            let nextDate = new Date(data.next_ts * 1000).toLocaleString();
-                            document.getElementById('next_date').innerText = `Scheduled for: ${nextDate}`;
-                        }
-                    }
-
-                    // Update health
-                    let healthEl = document.getElementById('health');
-                    let healthText = data.health;
-                    // Replace emojis with feather icons if any exist in status text
-                    healthText = healthText.replace('✅', '<i data-feather="check-circle" style="color: #10b981; width: 18px; height: 18px;"></i>');
-                    healthText = healthText.replace('❌', '<i data-feather="x-circle" style="color: #ef4444; width: 18px; height: 18px;"></i>');
-                    healthEl.innerHTML = healthText;
-
-                    // Update history
-                    let histHtml = "";
-                    if (data.history.length === 0) {
-                        histHtml = "<div class='history-item'>No emails sent yet.</div>";
-                    } else {
-                        data.history.forEach((h, i) => {
-                            let isSent = h.status.includes('Sent');
-                            let statusClass = isSent ? 'status-sent' : 'status-failed';
-                            let iconName = isSent ? 'check' : 'x';
-                            
-                            // strip emojis from status if they exist
-                            let cleanStatus = h.status.replace('✅ ', '').replace('❌ ', '');
-
-                            histHtml += `<div class="history-item">
-                                <div class="history-item-left">
-                                    <div class="history-status ${statusClass}">
-                                        <i data-feather="${iconName}" style="width: 16px; height: 16px;"></i>
-                                        ${cleanStatus}
-                                    </div>
-                                    <div style="color: var(--text-secondary);">${h.sent_at}</div>
-                                </div>
-                                <div style="font-weight: 500;">${h.articles} articles</div>
-                            </div>`;
-                        });
-                    }
-                    document.getElementById('history').innerHTML = histHtml;
-
-                    // Update logs
-                    let logBox = document.getElementById('logs');
-                    let wasAtBottom = logBox.scrollHeight - logBox.clientHeight <= logBox.scrollTop + 1;
-                    logBox.innerHTML = data.logs.join("<br>");
-                    if (wasAtBottom) {
-                        logBox.scrollTop = logBox.scrollHeight;
-                    }
-                    
-                    // Re-render new icons
-                    feather.replace();
-                });
-        }
-
-        function runNow() {
-            if (confirm("Build report and send email now?")) {
-                fetch('/api/run', {method: 'POST'});
-            }
-        }
-
-        function pingNow() {
-            fetch('/api/ping', {method: 'POST'})
-                .then(() => updateUI());
-        }
-
-        setInterval(updateUI, 1000);
-        updateUI();
-    </script>
-</body>
-</html>
-"""
-
-@app.route('/')
-def index():
-    return render_template_string(HTML_TEMPLATE)
-
-@app.route('/api/status')
-def status():
-    return jsonify({
-        "next_ts": app_state.get("next_send_ts"),
-        "history": app_state.get("email_history", []),
-        "health": health_status,
-        "logs": app_logs
-    })
-
-@app.route('/api/run', methods=['POST'])
-def api_run():
-    do_run()
-    return jsonify({"status": "started"})
-
-@app.route('/api/ping', methods=['POST'])
-def api_ping():
-    global health_status
-    health_status = health_check(add_log)
-    return jsonify({"status": "pinged", "health": health_status})
+# ───────────────────────────────────────────────────
+#  ENTRY POINT
+# ───────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    app_state = load_state()
-    threading.Thread(target=bg_schedule_loop, daemon=True).start()
-    threading.Thread(target=bg_health_loop, daemon=True).start()
-    app.run(host='0.0.0.0', port=8080)
+    app = ReporterApp(APP_STATE)
+    app.mainloop()
