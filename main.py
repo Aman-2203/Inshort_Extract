@@ -14,10 +14,12 @@ from datetime import datetime, timedelta
 
 import requests
 from bs4 import BeautifulSoup
-from docx import Document
-from docx.shared import Pt, Inches, RGBColor
-from docx.oxml.ns import qn
-from docx.oxml import OxmlElement
+from reportlab.lib.pagesizes import letter
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.units import inch
+from reportlab.lib.colors import Color
+import xml.sax.saxutils as saxutils
 
 import schedule
 load_dotenv()
@@ -29,7 +31,7 @@ load_dotenv()
 EMAIL_SENDER       = os.getenv("Email")      # Gmail address
 EMAIL_APP_PASSWORD =  os.getenv("psswd") 
 print(EMAIL_SENDER,EMAIL_APP_PASSWORD)      # 16-char App Password
-EMAIL_RECIPIENT    = "xxxxxspacm@gmail.com"       # where to send the report
+EMAIL_RECIPIENT    = "hrudayodgaar@gmail.com"       # where to send the report
 EMAIL_SUBJECT      = "Inshorts News Report"
 
 HEALTH_CHECK_URL   = "https://trial271225.onrender.com/"       # site to ping (keep-alive)
@@ -50,35 +52,6 @@ HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
-
-
-# ───────────────────────────────────────────────────
-#  DOCUMENT HELPERS
-# ───────────────────────────────────────────────────
-
-def set_margins(doc):
-    for section in doc.sections:
-        section.top_margin    = Inches(0.4)
-        section.bottom_margin = Inches(0.4)
-        section.left_margin   = Inches(0.5)
-        section.right_margin  = Inches(0.5)
-
-
-def tight_paragraph(doc, text, bold=False, font_size=10, color=None):
-    para = doc.add_paragraph()
-    run  = para.add_run(text)
-    run.bold = bold
-    run.font.size = Pt(font_size)
-    if color:
-        run.font.color.rgb = RGBColor(*color)
-    pPr     = para._p.get_or_add_pPr()
-    spacing = OxmlElement('w:spacing')
-    spacing.set(qn('w:before'),   '20')
-    spacing.set(qn('w:after'),    '20')
-    spacing.set(qn('w:line'),    '240')
-    spacing.set(qn('w:lineRule'), 'auto')
-    pPr.append(spacing)
-    return para
 
 
 # ───────────────────────────────────────────────────
@@ -149,34 +122,53 @@ def fetch_category(category: str, max_pages: int) -> list[dict]:
 # ───────────────────────────────────────────────────
 
 def build_report(log_fn=print):
-    """Build the .docx report purely in memory; returns (BytesIO, article_count)."""
+    """Build the .pdf report purely in memory; returns (BytesIO, article_count)."""
     log_fn("Building report...")
-    doc = Document()
-    set_margins(doc)
-    tight_paragraph(doc, 'Inshorts News Report', bold=True, font_size=16)
-    tight_paragraph(
-        doc,
-        f"Generated: {datetime.now().strftime('%d %B %Y, %I:%M %p')}",
-        font_size=9, color=(120, 120, 120),
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buf,
+        pagesize=letter,
+        rightMargin=0.5*inch,
+        leftMargin=0.5*inch,
+        topMargin=0.4*inch,
+        bottomMargin=0.4*inch
     )
+    
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle('Title', parent=styles['Normal'], fontName='Helvetica-Bold', fontSize=16, spaceAfter=6)
+    date_style = ParagraphStyle('Date', parent=styles['Normal'], fontName='Helvetica', fontSize=9, textColor=Color(120/255, 120/255, 120/255), spaceAfter=12)
+    cat_style = ParagraphStyle('Category', parent=styles['Normal'], fontName='Helvetica-Bold', fontSize=13, spaceAfter=8, spaceBefore=12)
+    headline_style = ParagraphStyle('Headline', parent=styles['Normal'], fontName='Helvetica-Bold', fontSize=10, spaceAfter=4)
+    art_date_style = ParagraphStyle('ArtDate', parent=styles['Normal'], fontName='Helvetica', fontSize=8, textColor=Color(100/255, 100/255, 100/255), spaceAfter=4)
+    body_style = ParagraphStyle('Body', parent=styles['Normal'], fontName='Helvetica', fontSize=9, spaceAfter=12)
+    sep_style = ParagraphStyle('Separator', parent=styles['Normal'], fontName='Helvetica', fontSize=8, textColor=Color(150/255, 150/255, 150/255), spaceAfter=12)
+    
+    story = []
+    story.append(Paragraph('Inshorts News Report', title_style))
+    story.append(Paragraph(f"Generated: {datetime.now().strftime('%d %B %Y, %I:%M %p')}", date_style))
+    
     total = 0
     for cat in CATEGORIES:
         log_fn(f"  Scraping: {cat.upper()}")
         articles = fetch_category(cat, MAX_PAGES)
-        tight_paragraph(doc, cat.capitalize(), bold=True, font_size=13)
+        story.append(Paragraph(cat.capitalize(), cat_style))
         if not articles:
-            tight_paragraph(doc, "  (No articles found)", font_size=9)
+            story.append(Paragraph("  (No articles found)", body_style))
             continue
+            
         for art in articles:
-            tight_paragraph(doc, art["headline"], bold=True, font_size=10)
-            tight_paragraph(doc, f"Date: {art['date']}", font_size=8, color=(100, 100, 100))
-            tight_paragraph(doc, art["body"], font_size=9)
-            tight_paragraph(doc, "-" * 30, font_size=8)
+            headline = saxutils.escape(art["headline"])
+            body = saxutils.escape(art["body"])
+            date_str = saxutils.escape(art["date"])
+            
+            story.append(Paragraph(headline, headline_style))
+            story.append(Paragraph(f"Date: {date_str}", art_date_style))
+            story.append(Paragraph(body, body_style))
+            story.append(Paragraph("-" * 50, sep_style))
             total += 1
         log_fn(f"    -> {len(articles)} articles")
 
-    buf = io.BytesIO()
-    doc.save(buf)
+    doc.build(story)
     buf.seek(0)
     log_fn(f"Report built in memory ({total} articles) — no file saved.")
     return buf, total
@@ -187,10 +179,10 @@ def build_report(log_fn=print):
 # ───────────────────────────────────────────────────
 
 def send_email(doc_buf: io.BytesIO, log_fn=print) -> bool:
-    """Attach the in-memory .docx buffer and send; no file is written to disk."""
+    """Attach the in-memory .pdf buffer and send; no file is written to disk."""
     try:
         log_fn(f"Sending email to {EMAIL_RECIPIENT}...")
-        filename = f"Inshorts_Report_{datetime.now().strftime('%Y%m%d')}.docx"
+        filename = f"Inshorts_Report_{datetime.now().strftime('%Y%m%d')}.pdf"
 
         msg = MIMEMultipart()
         msg["From"]    = EMAIL_SENDER
@@ -205,7 +197,7 @@ def send_email(doc_buf: io.BytesIO, log_fn=print) -> bool:
         )
         msg.attach(MIMEText(body, "plain"))
 
-        part = MIMEBase("application", "octet-stream")
+        part = MIMEBase("application", "pdf")
         part.set_payload(doc_buf.read())
         encoders.encode_base64(part)
         part.add_header("Content-Disposition", f"attachment; filename={filename}")
